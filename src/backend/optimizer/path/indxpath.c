@@ -35,11 +35,19 @@
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 
-
+/*
+ * 比较列的collation是否相同。collation指的是排序规则，不是PostgreSQL独有的概念，
+ * 同样一堆字符，在不同的排序规则下顺序可能不同。详情可以查阅其它资料。
+ */
 /* XXX see PartCollMatchesExprColl */
 #define IndexCollMatchesExprColl(idxcollation, exprcollation) \
 	((idxcollation) == InvalidOid || (idxcollation) == (exprcollation))
 
+/*
+ * 我们想生成索引扫描，还是位图扫描，还是任意一个都可以呢？
+ * 从下面的代码来看，只使用了ST_BITMAPSCAN和ST_ANYSCAN，并没有使用ST_INDEXSCAN。
+ * 在某些场景下，我们只想得到一个位图，因此使用ST_BITMAPSCAN标记
+ */
 /* Whether we are looking for plain indexscan, bitmap scan, or either */
 typedef enum
 {
@@ -48,6 +56,13 @@ typedef enum
 	ST_ANYSCAN					/* either is okay */
 } ScanTypeControl;
 
+/*
+ * 处理查询语句中的各种条件是本文件最复杂的工作之一。
+ * 在下面的处理中，经常需要把一系列条件与索引中的列进行匹配。这些条件按索引列进行组织，
+ * 即与同一个索引列匹配成功的所有条件，都被放在同一个List中。
+ * 因为一个索引最多有INDEX_MAX_KEYS个列，所以List数组的大小为INDEX_MAX_KEYS。
+ * 如果IndexClauseSet的List中没有任何条件，则nonempty为false；否则为true。这可以在某些场景下加速判断。
+ */
 /* Data structure for collecting qual clauses that match an index */
 typedef struct
 {
@@ -56,6 +71,12 @@ typedef struct
 	List	   *indexclauses[INDEX_MAX_KEYS];
 } IndexClauseSet;
 
+/*
+ * 在生成位图扫描路径时，需要在多个路径中选择一个子集，并且把子集中的路径AND起来。
+ * 选择最优子集算法的时间复杂度是指数级，PG使用了一些启发式规则，将时间复杂度降低到O(N^2)。
+ * 在应用这些启发式规则过程中，需要对路径进行排序，PathClauseUsage在排序过程中被使用，
+ * 它记录了每条路径上的一些信息。
+ */
 /* Per-path data used within choose_bitmap_and() */
 typedef struct
 {
@@ -66,6 +87,11 @@ typedef struct
 	bool		unclassifiable; /* has too many quals+preds to process? */
 } PathClauseUsage;
 
+/*
+ * PG在生成参数化路径过程中，会根据等价类推导出一些新的连接条件，这由generate_implied_equalities_for_column完成，
+ * 这个函数需要一个回调函数，在本文件中回调函数是ec_member_matches_indexcol，ec_member_matches_arg是
+ * ec_member_matches_indexcol的一个参数。
+ */
 /* Callback argument for ec_member_matches_indexcol */
 typedef struct
 {
@@ -227,6 +253,22 @@ static bool ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
  * In particular, comments below about "unparameterized" paths should be read
  * as meaning "unparameterized so far as the indexquals are concerned".
  */
+/*
+ * create_index_paths用来生成索引扫描路径，是本文件的入口函数。
+ *
+ * 如果想使用索引扫描，索引必须至少可以匹配一个过滤条件或连接条件，或者匹配查询的order by条件，
+ * 或者索引有一个谓词条件（部分索引）可以匹配查询中的条件.
+ *
+ * 基本的索引扫描有两种：plain和parameterized。
+ *
+ * 普通(plain)的索引扫描在indexqual（explain输出中的Index Cond）中只使用过滤条件（或者没有任何过滤条件，此时一定是IndexOnly Scan），
+ * 索引，它可以被用在任意上下文（指的是join的内外表）中。
+ *
+ * 参数化(parameterized)的索引扫描在indexqual中使用连接条件（也可能附加上过滤条件）。
+ * 当这样一个扫描路径和为它的indexqual提供参数的表进行join时，它必须是连接的内表，不能是外表（因为外表驱动内表，
+ * 为内表的扫描条件提供参数。反之，则不行）。这样的连接必须是Nestloop join，不能是merge join或hash join。
+ * 在这种场景下，每次外表扫描到新值时，都需要对内表的index scan调用rescan，以便将外表的参数传递给内表的index scan。
+ */
 void
 create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -246,6 +288,7 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	/* Bitmap paths are collected and then dealt with at the end */
 	bitindexpaths = bitjoinpaths = joinorclauses = NIL;
 
+	/* 首先遍历表上的每个索引 */
 	/* Examine each index in turn */
 	foreach(lc, rel->indexlist)
 	{
@@ -259,11 +302,18 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		 * (generate_bitmap_or_paths() might be able to do something with
 		 * them, but that's of no concern here.)
 		 */
+		/*
+		 * 如果这是一个部分索引，并且与查询不匹配，则忽略这个索引。
+		 * 比如索引中仅包含a>10的数据，但是查询条件是a>0，则不能只用这个索引。
+		 */
 		if (index->indpred != NIL && !index->predOK)
 			continue;
 
 		/*
 		 * Identify the restriction clauses that can match the index.
+		 */
+		/*
+		 * 把过滤条件与索引进行匹配，匹配结果放在rclauseset中，参考上文IndexClauseSet中的注释。
 		 */
 		MemSet(&rclauseset, 0, sizeof(rclauseset));
 		match_restriction_clauses_to_index(root, index, &rclauseset);
@@ -272,6 +322,11 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		 * Build index paths from the restriction clauses.  These will be
 		 * non-parameterized paths.  Plain paths go directly to add_path(),
 		 * bitmap paths are added to bitindexpaths to be handled below.
+		 */
+		/*
+		 * 使用过滤条件生成索引扫描路径。这些都是非参数化路径。索引扫描、Index Only Scan的路径
+		 * 可以用add_path添加到结果中；位图扫描的路径暂时先放在bitindexpaths中，
+		 * 后面还要对这些位图扫描路径进行处理
 		 */
 		get_index_paths(root, rel, index, &rclauseset,
 						&bitindexpaths);
@@ -282,6 +337,11 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		 * step finds only "loose" join clauses that have not been merged into
 		 * EquivalenceClasses.  Also, collect join OR clauses for later.
 		 */
+		/*
+		 * 把连接条件与索引进行匹配，匹配结果放在jclauseset中，参考上文IndexClauseSet中的注释。
+		 * 这里匹配的连接条件，都还没有被merge到等价类中。
+		 * OR类型的条件暂时被放在joinorclauses中，供后文用来生成OR类型的位图扫描。
+		 */
 		MemSet(&jclauseset, 0, sizeof(jclauseset));
 		match_join_clauses_to_index(root, rel, index,
 									&jclauseset, &joinorclauses);
@@ -290,14 +350,24 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		 * Look for EquivalenceClasses that can generate joinclauses matching
 		 * the index.
 		 */
+		/*
+		 * 使用等价类推出新的连接条件，并把这些条件与索引进行匹配，匹配结果放在eclauseset中，
+		 * 参考上文IndexClauseSet中的注释。
+		 */
 		MemSet(&eclauseset, 0, sizeof(eclauseset));
 		match_eclass_clauses_to_index(root, index,
 									  &eclauseset);
 
 		/*
+		 * 上面三处匹配，最终都调用了match_clause_to_index，只是外层对不同的连接列表进行迭代而已，
+		 * 读者可以把三个函数进行对比，很容易就可以发现这一点。
+		 */
+
+		/*
 		 * If we found any plain or eclass join clauses, build parameterized
 		 * index paths using them.
 		 */
+		/* 如果最后两处匹配的结果非空，则尝试生成参数化路径 */
 		if (jclauseset.nonempty || eclauseset.nonempty)
 			consider_index_join_clauses(root, rel, index,
 										&rclauseset,
@@ -306,6 +376,14 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 										&bitjoinpaths);
 	}
 
+	/*
+	 * PG在优化阶段，会对谓词条件进行拉平，也就是说，把所有条件放在一个列表中，这些条件的关系是AND。
+	 * 列表中的单个条件，可能是一个OR类型的符合条件，比如整个列表可能表示a = 1 and (b = 1 or c =1)，
+	 * (b = 1 or c =1)就是一个OR类型的符合条件。连接条件中的这种条件已经被保存在joinorclauses中。
+	 * OR类型的条件在上面的路径生成过程中没有发挥任何作用，因此下面对这种类型的处理。
+	 *
+	 * 这是为什么这里只调用generate_bitmap_or_paths，并没有调用generate_bitmap_and_paths的原因。
+	 */
 	/*
 	 * Generate BitmapOrPaths for any suitable OR-clauses present in the
 	 * restriction list.  Add these to bitindexpaths.
@@ -317,6 +395,10 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	/*
 	 * Likewise, generate BitmapOrPaths for any suitable OR-clauses present in
 	 * the joinclause list.  Add these to bitjoinpaths.
+	 */
+	/*
+	 * 把rel->baserestrictinfo作为other_rels传入generate_bitmap_or_paths可能得到更好的路径，
+	 * 毕竟每多一个条件，就可能过滤掉更多的不满足条件的元组。
 	 */
 	indexpaths = generate_bitmap_or_paths(root, rel,
 										  joinorclauses, rel->baserestrictinfo);
@@ -334,6 +416,12 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		Path	   *bitmapqual;
 		BitmapHeapPath *bpath;
 
+		/*
+		 * 使用choose_bitmap_and在所有位图扫描路径中选出一个子集，对子集中的路径求AND，
+		 * 生成最终的位图扫描路径。
+		 *
+		 * 这里生成的位图扫描路径是非参数化路径。
+		 */
 		bitmapqual = choose_bitmap_and(root, rel, bitindexpaths);
 		bpath = create_bitmap_heap_path(root, rel, bitmapqual,
 										rel->lateral_relids, 1.0, 0);
@@ -344,6 +432,9 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			create_partial_bitmap_paths(root, rel, bitmapqual);
 	}
 
+	/*
+	 * 同理，生成参数化的位图扫描路径。为每种参数的组合生成一个位图扫描路径。
+	 */
 	/*
 	 * Likewise, if we found anything usable, generate BitmapHeapPaths for the
 	 * most promising combinations of join bitmap index paths.  Our strategy
@@ -360,17 +451,20 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		ListCell   *lc;
 
 		/* Identify each distinct parameterization seen in bitjoinpaths */
+		/* 找出所有不同参数化方式的集合，两种不同的参数化方式使用的外表集合不同 */
 		all_path_outers = NIL;
 		foreach(lc, bitjoinpaths)
 		{
 			Path	   *path = (Path *) lfirst(lc);
 			Relids		required_outer = PATH_REQ_OUTER(path);
 
+			/* 去重 */
 			if (!bms_equal_any(required_outer, all_path_outers))
 				all_path_outers = lappend(all_path_outers, required_outer);
 		}
 
 		/* Now, for each distinct parameterization set ... */
+		/* 对每种参数化方式进行下面的操作 */
 		foreach(lc, all_path_outers)
 		{
 			Relids		max_outers = (Relids) lfirst(lc);
@@ -382,6 +476,11 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			ListCell   *lcp;
 
 			/* Identify all the bitmap join paths needing no more than that */
+			/*
+			 * 找出所有满足这种参数化方式的位图扫描路径。即找出所有需要的外表集合被max_outers
+			 * 包含的那些位图扫描路径。假如max_outers为{t1, t2}，如果某个位图扫描路径P需要t3表为它
+			 * 提供参数，则本次循环不能使用P。
+			 */
 			this_path_set = NIL;
 			foreach(lcp, bitjoinpaths)
 			{
@@ -395,13 +494,19 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			 * Add in restriction bitmap paths, since they can be used
 			 * together with any join paths.
 			 */
+			/*
+			 * 把非参数化位图扫描路径也加进来，这可能会产生更好的结果。
+			 * 这些路径不需要任何外表为它们提供参数，因此可以直接加进来。
+			 */
 			this_path_set = list_concat(this_path_set, bitindexpaths);
 
+			/* 同上，选出一个位图扫描路径的集合，把它们AND起来 */
 			/* Select best AND combination for this parameterization */
 			bitmapqual = choose_bitmap_and(root, rel, this_path_set);
 
 			/* And push that path into the mix */
 			required_outer = PATH_REQ_OUTER(bitmapqual);
+			/* 估算外表可以提供多少种不同的值，即这个位图扫描路径需要循环执行多少次。 */
 			loop_count = get_loop_count(root, rel->relid, required_outer);
 			bpath = create_bitmap_heap_path(root, rel, bitmapqual,
 											required_outer, loop_count, 0);
@@ -410,6 +515,22 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	}
 }
 
+/*
+ * 生成参数化路径使用的算法是：
+ * 1)首先确定一个外表集合S，这些外表集合为参数化路径提供参数
+ * 2)找出合适的条件，即排除使用除S之外的表为其提供参数的条件
+ *
+ * 尽量把这些条件放在indexqual上，而不是filter(qpqual)上。
+ *
+ * 这看起来算法复杂度很高，但是在实际中外表的组合方式不是很多。这里还使用了一种
+ * 启发式规则来限制外表的组合数量。
+ */
+
+/*
+ * 因为条件被匹配到索引的每个列上，所以需要对索引列进行迭代。
+ * consider_index_join_clauses函数的功能就是对索引列进行迭代，
+ * 然后调用consider_index_join_outer_rels
+ */
 /*
  * consider_index_join_clauses
  *	  Given sets of join clauses for an index, decide which parameterized
@@ -491,6 +612,7 @@ consider_index_join_clauses(PlannerInfo *root, RelOptInfo *rel,
  * 'considered_clauses' is the total number of clauses considered (so far)
  * '*considered_relids' is a list of all relids sets already considered
  */
+/* 这个函数的主要作用就是生成不同的外表集合，然后调用get_join_index_paths */
 static void
 consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 							   IndexOptInfo *index,
@@ -512,6 +634,7 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 		EquivalenceClass *parent_ec = iclause->rinfo->parent_ec;
 		int			num_considered_relids;
 
+		/* 已经考虑过这种外表的组合 */
 		/* If we already tried its relids set, no need to do so again */
 		if (bms_equal_any(clause_relids, *considered_relids))
 			continue;
@@ -528,6 +651,10 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 		 * loop, so we don't use foreach() here.  No real harm would be done
 		 * if we did visit them, since the subset check would reject them; but
 		 * it would waste some cycles.
+		 */
+		/*
+		 * 下面尝试生成一种新的外表集合，并且使用这个集合调用get_join_index_paths
+		 * 生成参数化路径
 		 */
 		num_considered_relids = list_length(*considered_relids);
 		for (int pos = 0; pos < num_considered_relids; pos++)
@@ -573,6 +700,10 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 		}
 
 		/* Also try this set of relids by itself */
+		/*
+		 * 使用单个条件所涉及的外表集合。不用担心重复，
+		 * 因为get_join_index_paths的开头会做精确的检查
+		 */
 		get_join_index_paths(root, rel, index,
 							 rclauseset, jclauseset, eclauseset,
 							 bitindexpaths,
@@ -594,6 +725,11 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
  * 'relids' is the current set of relids to consider (the target rel plus
  *		one or more outer rels)
  */
+/*
+ * 现在已经有了一个外表的集合S，这些外表为内表的参数化路径提供参数。
+ * 下面需要再次遍历（因为条件按索引列分组，因此需要再次按索引列遍历）每个条件，
+ * 把所有合适的条件（只要引用的外表被集合S包含就满足条件）找出来。
+ */
 static void
 get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 					 IndexOptInfo *index,
@@ -614,6 +750,11 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	/* Identify indexclauses usable with this relids set */
 	MemSet(&clauseset, 0, sizeof(clauseset));
 
+	/*
+	 * 遍历索引列上的每个条件，把所有合适的条件找出来
+	 * 先找简单的连接条件，然后通过等价类生成的条件，最后把过滤条件加上。
+	 * 因为过滤条件不依赖任何外表，因此可以直接加上。
+	 */
 	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 	{
 		ListCell   *lc;
@@ -658,6 +799,7 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	/* We should have found something, else caller passed silly relids */
 	Assert(clauseset.nonempty);
 
+	/* 使用这些条件生成参数化路径 */
 	/* Build index path(s) using the collected set of clauses */
 	get_index_paths(root, rel, index, &clauseset, bitindexpaths);
 
@@ -724,6 +866,12 @@ bms_equal_any(Relids relids, List *relids_list)
  * paths, and then make a separate attempt to include them in bitmap paths.
  * Furthermore, we should consider excluding lower-order ScalarArrayOpExpr
  * quals so as to create ordered paths.
+ */
+/*
+ * 根据一系列条件，生成扫描路径。此函数共被两处调用点调用。第一次用来生成普通的
+ * 扫描路径，第二次用来生成参数化扫描路径。
+ *
+ * 本函数调用build_index_paths三次，主要是在处理SAOP。请参考张树杰的书第261—265页。
  */
 static void
 get_index_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -910,6 +1058,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	index_clauses = NIL;
 	found_lower_saop_clause = false;
 	outer_relids = bms_copy(rel->lateral_relids);
+	/* 处理SAOP */
 	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 	{
 		ListCell   *lc;
@@ -959,6 +1108,11 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 		 * is always okay for columns after the first to not have any
 		 * clauses.)
 		 */
+		/*
+		 * 如果在第一个索引列上没有匹配的条件，并且这种索引必须要求在第一个索引列上
+		 * 有匹配的条件，则返回NIL。当indexcol>0时，如果代码运行到这里，
+		 * index_clauses一定非空，否则在index_clauses=0时，已经返回NIL了。
+		 */
 		if (index_clauses == NIL && !index->amoptionalkey)
 			return NIL;
 	}
@@ -969,6 +1123,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	if (bms_is_empty(outer_relids))
 		outer_relids = NULL;
 
+	/* 估计外表可以提供多少种不同的值，即内表的路径需要循环多少次 */
 	/* Compute loop_count for cost estimation purposes */
 	loop_count = get_loop_count(root, rel->relid, outer_relids);
 
@@ -977,6 +1132,9 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * many of them are actually useful for this query.  This is not relevant
 	 * if we are only trying to build bitmap indexscans, nor if we have to
 	 * assume the scan is unordered.
+	 */
+	/*
+	 * PathKey是否有用，请参考张树杰的书第266页。
 	 */
 	pathkeys_possibly_useful = (scantype != ST_BITMAPSCAN &&
 								!found_lower_saop_clause &&
@@ -993,6 +1151,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	}
 	else if (index->amcanorderbyop && pathkeys_possibly_useful)
 	{
+		/* amcanorderbyop表示是否支持KNN查询，btree不支持。最初只有gist索引支持 */
 		/* see if we can generate ordering operators for query_pathkeys */
 		match_pathkeys_to_index(index, root->query_pathkeys,
 								&orderbyclauses,
@@ -1023,6 +1182,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * later merging or final output ordering, OR the index has a useful
 	 * predicate, OR an index-only scan is possible.
 	 */
+	/* 满足这4种条件之一，才能使用索引 */
 	if (index_clauses != NIL || useful_pathkeys != NIL || useful_predicate ||
 		index_only_scan)
 	{
@@ -1151,6 +1311,13 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
  * 'rel' is the relation for which we want to generate index paths
  * 'clauses' is the current list of clauses (RestrictInfo nodes)
  * 'other_clauses' is the list of additional upper-level clauses
+ */
+/*
+ * 此函数被generate_bitmap_or_paths调用，建议先看generate_bitmap_or_paths，
+ * 再看此函数。
+ * 
+ * 对查询中符合要求的OR条件中的每个子条件生成位图扫描路径，因为这个条件可能涉及
+ * 多个索引，因此需要迭代每一个索引。
  */
 static List *
 build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
@@ -1314,6 +1481,10 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 			 * If nothing matched this arm, we can't do anything with this OR
 			 * clause.
 			 */
+			/*
+			 * 既然是把OR条件拆成了多个，那么每个子条件都必须可以生成一个位图才行，任何一个
+			 * 子条件不能生成位图，则整个OR条件不能生成位图扫描路径，结束循环，返回NIL。
+			 */
 			if (indlist == NIL)
 			{
 				pathlist = NIL;
@@ -1354,6 +1525,7 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
  * The result is either a single one of the inputs, or a BitmapAndPath
  * combining multiple inputs.
  */
+/* 这个函数从一系列路径中，选出一个集合，并把它们AND起来 */
 static Path *
 choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 {
