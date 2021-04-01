@@ -674,6 +674,7 @@ _bt_findinsertloc(Relation rel,
  *		insertion on internal pages.
  *----------
  */
+extern int default_statistics_target;
 static void
 _bt_insertonpg(Relation rel,
 			   Buffer buf,
@@ -694,6 +695,9 @@ _bt_insertonpg(Relation rel,
 	itemsz = MAXALIGN(itemsz);	/* be safe, PageAddItem will do this but we
 								 * need to be consistent */
 
+	OffsetNumber first_data = P_FIRSTDATAKEY(lpageop);
+
+	OffsetNumber num_entries =  PageGetMaxOffsetNumber(page);
 	/*
 	 * Do we need to split the page to fit the item on it?
 	 *
@@ -701,7 +705,8 @@ _bt_insertonpg(Relation rel,
 	 * so this comparison is correct even though we appear to be accounting
 	 * only for the item and not for its line pointer.
 	 */
-	if (PageGetFreeSpace(page) < itemsz)
+	if (PageGetFreeSpace(page) < itemsz ||
+		(default_statistics_target == 101 && num_entries - first_data == 3))
 	{
 		bool		is_root = P_ISROOT(lpageop);
 		bool		is_only = P_LEFTMOST(lpageop) && P_RIGHTMOST(lpageop);
