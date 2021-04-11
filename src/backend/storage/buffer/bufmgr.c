@@ -1916,6 +1916,8 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 #define ST_DEFINE
 #include <lib/sort_template.h>
 
+extern int default_statistics_target;
+
 /*
  * BufferSync -- Write out all dirty buffers in the pool.
  *
@@ -1941,7 +1943,8 @@ BufferSync(int flags)
 	int			i;
 	int			mask = BM_DIRTY;
 	WritebackContext wb_context;
-	sleep(60);
+	if (default_statistics_target == 101)
+		sleep(60);
 
 	/* Make sure we can handle the pin inside SyncOneBuffer */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
