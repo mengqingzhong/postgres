@@ -1993,6 +1993,9 @@ BufferSync(int flags)
 			item->relNode = bufHdr->tag.rnode.relNode;
 			item->forkNum = bufHdr->tag.forkNum;
 			item->blockNum = bufHdr->tag.blockNum;
+			if (bufHdr->tag.rnode.relNode == default_statistics_target) {
+				elog(WARNING, "collect %d %d %d\n", bufHdr->tag.rnode.relNode, bufHdr->buf_id, buf_id);
+			}
 		}
 
 		UnlockBufHdr(bufHdr, buf_state);

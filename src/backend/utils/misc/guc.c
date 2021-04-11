@@ -2824,7 +2824,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_S
 		},
 		&CheckPointTimeout,
-		300, 30, 86400,
+		86400, 30, 86400,
 		NULL, NULL, NULL
 	},
 
@@ -3044,7 +3044,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_MS
 		},
 		&BgWriterDelay,
-		200, 10, 10000,
+		86400000, 10, 86400000,
 		NULL, NULL, NULL
 	},
 

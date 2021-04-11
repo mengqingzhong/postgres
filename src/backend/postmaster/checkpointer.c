@@ -143,7 +143,7 @@ static CheckpointerShmemStruct *CheckpointerShmem;
 /*
  * GUC parameters
  */
-int			CheckPointTimeout = 300;
+int			CheckPointTimeout = 86400;
 int			CheckPointWarning = 30;
 double		CheckPointCompletionTarget = 0.9;
 
