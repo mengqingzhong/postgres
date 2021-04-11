@@ -54,7 +54,7 @@
 #include "utils/rel.h"
 #include "utils/resowner_private.h"
 #include "utils/timestamp.h"
-
+extern int			default_statistics_target;
 
 /* Note: these two macros only work on shared buffers, not local ones! */
 #define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
